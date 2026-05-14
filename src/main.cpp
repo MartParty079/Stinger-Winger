@@ -21,15 +21,22 @@ const int KILL_RELAY_PIN = 26;
 // relay ON  = engine allowed to run
 //
 // If your relay module is active LOW, swap these.
-const int RELAY_RUN_STATE = HIGH;
-const int RELAY_KILL_STATE = LOW;
+const int RELAY_RUN_STATE = LOW;
+const int RELAY_KILL_STATE = HIGH;
 
 // RPM settings
 const float PULSES_PER_REV = 1.0;
-const uint32_t RPM_SAMPLE_MS = 100;
+
+// RPM updates every 200 ms.
+// With 1 pulse/rev, resolution is about 300 RPM.
+const uint32_t RPM_SAMPLE_MS = 200;
+
+// If no Hall pulse for this long, RPM = 0
 const uint32_t RPM_TIMEOUT_MS = 1000;
 
 // Hall sensor noise filter
+// For 10,000 RPM and 1 pulse/rev, pulse spacing is about 6000 us.
+// 1000 us blocks false bounce/noise but still allows high RPM.
 const uint32_t MIN_PULSE_SPACING_US = 1000;
 
 // Servo calibration
@@ -253,7 +260,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="card">
     <h2>Current RPM</h2>
     <div class="rpm-value" id="rpm">0</div>
-    <p class="small">Live Hall sensor reading</p>
+    <p class="small">HIGH-output Hall sensor on GPIO 27</p>
   </div>
 
   <div class="card">
@@ -593,7 +600,8 @@ function clearLog() {
   alert("RPM log cleared.");
 }
 
-setInterval(updateData, 100);
+// Webpage updates every 200 ms
+setInterval(updateData, 200);
 updateData();
 </script>
 
@@ -627,7 +635,7 @@ void enableRunRelay() {
 int percentToMicroseconds(int percent) {
   percent = constrain(percent, 0, 100);
 
-  // Normal direction:
+  // Normal direction
   return map(percent, 0, 100, SERVO_MIN_US, SERVO_MAX_US);
 
   // If servo direction is backward, comment the line above and use this:
@@ -860,12 +868,15 @@ void setup() {
   digitalWrite(KILL_RELAY_PIN, RELAY_KILL_STATE);
   engineRunEnabled = false;
 
-  pinMode(HALL_PIN, INPUT_PULLUP);
+  // HIGH-output Hall sensor:
+  // inactive = LOW
+  // active pulse = HIGH
+  pinMode(HALL_PIN, INPUT_PULLDOWN);
 
   attachInterrupt(
     digitalPinToInterrupt(HALL_PIN),
     hallISR,
-    FALLING
+    RISING
   );
 
   throttleServo.setPeriodHertz(50);
@@ -888,6 +899,8 @@ void setup() {
   Serial.println(AP_PASSWORD);
   Serial.print("Open: http://");
   Serial.println(ip);
+  Serial.println("Hall Input: HIGH pulse, RISING edge");
+  Serial.println("RPM Sample Time: 200 ms");
   Serial.println("======================================");
 
   server.on("/", handleRoot);
@@ -922,48 +935,41 @@ void loop() {
     int usableMaxThrottle = getUsableMaxThrottle();
     int servoMicros = percentToMicroseconds(throttleOutputPercent);
 
-    Serial.println("=================================");
     Serial.print("RPM: ");
-    Serial.println(currentRPM);
+    Serial.print(currentRPM);
 
-    Serial.print("Throttle Input Command: ");
+    Serial.print(" | Input: ");
     Serial.print(throttleInputPercent);
-    Serial.println("%");
+    Serial.print("%");
 
-    Serial.print("Actual Servo Output: ");
+    Serial.print(" | Servo Output: ");
     Serial.print(throttleOutputPercent);
-    Serial.println("%");
+    Serial.print("%");
 
-    Serial.print("Servo Pulse: ");
+    Serial.print(" | Servo Pulse: ");
     Serial.print(servoMicros);
-    Serial.println(" us");
+    Serial.print(" us");
 
-    Serial.print("Idle Limit: ");
+    Serial.print(" | Idle Limit: ");
     Serial.print(idleThrottlePercent);
-    Serial.println("%");
+    Serial.print("%");
 
-    Serial.print("Max Limit: ");
+    Serial.print(" | Max Limit: ");
     Serial.print(maxThrottlePercent);
-    Serial.println("%");
+    Serial.print("%");
 
-    Serial.print("100% Trim: ");
+    Serial.print(" | Trim: ");
     Serial.print(throttleTrimPercent);
-    Serial.println("%");
+    Serial.print("%");
 
-    Serial.print("Usable Max After Trim: ");
+    Serial.print(" | Usable Max: ");
     Serial.print(usableMaxThrottle);
-    Serial.println("%");
+    Serial.print("%");
 
-    Serial.print("Servo Range: ");
-    Serial.print(SERVO_MIN_US);
-    Serial.print(" - ");
-    Serial.print(SERVO_MAX_US);
-    Serial.println(" us");
+    Serial.print(" | Engine: ");
+    Serial.print(engineRunEnabled ? "RUN ENABLED" : "KILLED");
 
-    Serial.print("Engine: ");
-    Serial.println(engineRunEnabled ? "RUN ENABLED" : "KILLED");
-
-    Serial.print("Sweep: ");
+    Serial.print(" | Sweep: ");
     Serial.println(sweepRunning ? "RUNNING" : "STOPPED");
   }
 }
