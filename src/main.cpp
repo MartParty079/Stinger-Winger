@@ -75,6 +75,8 @@ int throttleBaseOutputPercent = 0;  // mapped output before individual trims
 int servoTrimPercent[4] = {0, 0, 0, 0};
 int servoOutputPercent[4] = {0, 0, 0, 0};
 
+int throttleArray[21] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0};
+
 bool engineRunEnabled = false;
 
 uint32_t lastRPMCalcMs = 0;
@@ -862,6 +864,25 @@ void handleKill() {
 void handleEnableRun() {
   enableRun();
   server.send(200, "text/plain", "RUN ENABLED");
+}
+
+// =======================================================
+// Throttle Sweep
+// =======================================================
+
+void throttleSweep() {
+  // Set throttle level to array defined values
+  //--Todo - Make read array from JSON
+  //--Todo - Make for loop to make arrays
+  //int throttleSize = 10; //Step size in percent
+  //int throttleSteps = 100/10; //Amount of steps
+  
+  //for loop to fill in the array
+
+  // {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0}
+
+  
+
 }
 
 // =======================================================
