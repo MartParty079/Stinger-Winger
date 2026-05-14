@@ -12,16 +12,18 @@ const char* AP_PASSWORD = "12345678";
 
 // Pins
 const int HALL_PIN = 27;
-const int SERVO_PIN = 25;
 const int KILL_RELAY_PIN = 26;
 
+// Four servo signal pins
+const int SERVO1_PIN = 25;
+const int SERVO2_PIN = 14;
+const int SERVO3_PIN = 12;
+const int SERVO4_PIN = 13;
+
 // Relay logic
-// This code assumes:
+// Assumption:
 // relay OFF = engine killed
 // relay ON  = engine allowed to run
-//
-// If your relay module is active LOW, set this to LOW.
-// If your relay module is active HIGH, set this to HIGH.
 const int RELAY_RUN_STATE = HIGH;
 const int RELAY_KILL_STATE = LOW;
 
@@ -41,12 +43,25 @@ const int SERVO_MAX_US = 2000;
 int idleThrottlePercent = 0;
 int maxThrottlePercent = 30;
 
+// Servo trim limits
+// Individual trims are added after the main throttle output.
+// Example: base output 20%, trim +3% => servo output 23%.
+const int MIN_SERVO_TRIM = -30;
+const int MAX_SERVO_TRIM = 30;
+
 // =======================================================
 // GLOBALS
 // =======================================================
 
 WebServer server(80);
-Servo throttleServo;
+
+Servo servos[4];
+const int servoPins[4] = {
+  SERVO1_PIN,
+  SERVO2_PIN,
+  SERVO3_PIN,
+  SERVO4_PIN
+};
 
 volatile uint32_t pulseCount = 0;
 volatile uint32_t lastPulseMicros = 0;
@@ -54,8 +69,11 @@ portMUX_TYPE pulseMux = portMUX_INITIALIZER_UNLOCKED;
 
 float currentRPM = 0.0;
 
-int throttleInputPercent = 0;
-int throttleOutputPercent = 0;
+int throttleInputPercent = 0;       // 0-100 command from web
+int throttleBaseOutputPercent = 0;  // mapped output before individual trims
+
+int servoTrimPercent[4] = {0, 0, 0, 0};
+int servoOutputPercent[4] = {0, 0, 0, 0};
 
 bool engineRunEnabled = false;
 
@@ -88,7 +106,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       border-radius: 14px;
       padding: 20px;
       margin: 15px auto;
-      max-width: 780px;
+      max-width: 820px;
       box-shadow: 0 0 20px rgba(0,0,0,0.45);
     }
 
@@ -187,11 +205,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       border-top: 1px solid #333;
       margin: 20px 0;
     }
+
+    table {
+      margin: 10px auto;
+      border-collapse: collapse;
+      width: 90%;
+      max-width: 650px;
+    }
+
+    th, td {
+      border-bottom: 1px solid #333;
+      padding: 10px;
+    }
+
+    th {
+      color: #aaa;
+    }
   </style>
 </head>
 
 <body>
-  <h1>Stinger 125cc RPM + Throttle</h1>
+  <h1>Stinger 125cc RPM + 4-Servo Throttle</h1>
 
   <div class="card">
     <h2>Engine Kill Switch</h2>
@@ -204,7 +238,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button class="big-kill" onclick="killEngine()">KILL ENGINE</button>
 
     <p class="small">
-      Kill command also sends throttle input to 0%.
+      Kill command also sends all throttle servos to idle.
     </p>
   </div>
 
@@ -215,14 +249,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="card">
-    <h2>Throttle</h2>
+    <h2>Main Throttle Control</h2>
 
     <div class="data-row">
       Input command: <span class="throttle-yellow" id="throttleInputDisplay">0</span>%
     </div>
 
     <div class="data-row">
-      Actual servo output: <span class="throttle-yellow" id="throttleOutputDisplay">0</span>%
+      Base throttle output: <span class="throttle-yellow" id="throttleBaseOutputDisplay">0</span>%
     </div>
 
     <div class="data-row">
@@ -235,7 +269,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <hr>
 
-    <h3>Manual Throttle Command</h3>
+    <h3>Control All 4 Servos Together</h3>
     <input id="throttleInput" type="number" min="0" max="100" value="0">
     <button onclick="setThrottle()">Set Throttle</button>
     <button class="danger" onclick="idleNow()">Idle Now</button>
@@ -254,8 +288,51 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button onclick="setLimits()">Set Limits</button>
 
     <p class="small">
-      The throttle command is 0-100%. Servo output is mapped between idle and max.
+      Main throttle command is 0-100%. Base output is mapped between idle and max.
     </p>
+  </div>
+
+  <div class="card">
+    <h2>Individual Servo Adjustments</h2>
+
+    <p class="small">
+      Trim is added to the base throttle output. Example: base 20%, trim +3%, servo output 23%.
+    </p>
+
+    <table>
+      <tr>
+        <th>Servo</th>
+        <th>Trim %</th>
+        <th>Actual Output %</th>
+      </tr>
+
+      <tr>
+        <td>Servo 1</td>
+        <td><input id="trim1Input" type="number" min="-30" max="30" value="0"></td>
+        <td><span class="throttle-yellow" id="servo1Output">0</span>%</td>
+      </tr>
+
+      <tr>
+        <td>Servo 2</td>
+        <td><input id="trim2Input" type="number" min="-30" max="30" value="0"></td>
+        <td><span class="throttle-yellow" id="servo2Output">0</span>%</td>
+      </tr>
+
+      <tr>
+        <td>Servo 3</td>
+        <td><input id="trim3Input" type="number" min="-30" max="30" value="0"></td>
+        <td><span class="throttle-yellow" id="servo3Output">0</span>%</td>
+      </tr>
+
+      <tr>
+        <td>Servo 4</td>
+        <td><input id="trim4Input" type="number" min="-30" max="30" value="0"></td>
+        <td><span class="throttle-yellow" id="servo4Output">0</span>%</td>
+      </tr>
+    </table>
+
+    <button onclick="setTrims()">Set Servo Trims</button>
+    <button onclick="zeroTrims()">Zero Trims</button>
   </div>
 
   <div class="card">
@@ -287,6 +364,7 @@ let loggingEnabled = false;
 let logStartTime = null;
 
 let limitsHaveLoaded = false;
+let trimsHaveLoaded = false;
 
 const canvas = document.getElementById("graph");
 const ctx = canvas.getContext("2d");
@@ -341,9 +419,15 @@ async function updateData() {
     document.getElementById("rpm").innerText = Math.round(data.rpm);
 
     document.getElementById("throttleInputDisplay").innerText = data.throttleInput;
-    document.getElementById("throttleOutputDisplay").innerText = data.throttleOutput;
+    document.getElementById("throttleBaseOutputDisplay").innerText = data.throttleBaseOutput;
+
     document.getElementById("idleDisplay").innerText = data.idleThrottle;
     document.getElementById("maxDisplay").innerText = data.maxThrottle;
+
+    document.getElementById("servo1Output").innerText = data.servo1Output;
+    document.getElementById("servo2Output").innerText = data.servo2Output;
+    document.getElementById("servo3Output").innerText = data.servo3Output;
+    document.getElementById("servo4Output").innerText = data.servo4Output;
 
     const engineStatus = document.getElementById("engineStatus");
 
@@ -361,6 +445,14 @@ async function updateData() {
       limitsHaveLoaded = true;
     }
 
+    if (!trimsHaveLoaded) {
+      document.getElementById("trim1Input").value = data.servo1Trim;
+      document.getElementById("trim2Input").value = data.servo2Trim;
+      document.getElementById("trim3Input").value = data.servo3Trim;
+      document.getElementById("trim4Input").value = data.servo4Trim;
+      trimsHaveLoaded = true;
+    }
+
     const now = new Date();
 
     rpmData.push(data.rpm);
@@ -370,7 +462,15 @@ async function updateData() {
         seconds: ((now - logStartTime) / 1000).toFixed(2),
         rpm: Math.round(data.rpm),
         throttleInput: data.throttleInput,
-        throttleOutput: data.throttleOutput,
+        throttleBaseOutput: data.throttleBaseOutput,
+        servo1Output: data.servo1Output,
+        servo2Output: data.servo2Output,
+        servo3Output: data.servo3Output,
+        servo4Output: data.servo4Output,
+        servo1Trim: data.servo1Trim,
+        servo2Trim: data.servo2Trim,
+        servo3Trim: data.servo3Trim,
+        servo4Trim: data.servo4Trim,
         idleThrottle: data.idleThrottle,
         maxThrottle: data.maxThrottle,
         engineRunEnabled: data.engineRunEnabled ? 1 : 0
@@ -426,6 +526,36 @@ async function setLimits() {
   updateData();
 }
 
+async function setTrims() {
+  let t1 = Number(document.getElementById("trim1Input").value);
+  let t2 = Number(document.getElementById("trim2Input").value);
+  let t3 = Number(document.getElementById("trim3Input").value);
+  let t4 = Number(document.getElementById("trim4Input").value);
+
+  t1 = Math.max(-30, Math.min(30, t1));
+  t2 = Math.max(-30, Math.min(30, t2));
+  t3 = Math.max(-30, Math.min(30, t3));
+  t4 = Math.max(-30, Math.min(30, t4));
+
+  document.getElementById("trim1Input").value = t1;
+  document.getElementById("trim2Input").value = t2;
+  document.getElementById("trim3Input").value = t3;
+  document.getElementById("trim4Input").value = t4;
+
+  await fetch("/setTrims?t1=" + t1 + "&t2=" + t2 + "&t3=" + t3 + "&t4=" + t4);
+  updateData();
+}
+
+async function zeroTrims() {
+  document.getElementById("trim1Input").value = 0;
+  document.getElementById("trim2Input").value = 0;
+  document.getElementById("trim3Input").value = 0;
+  document.getElementById("trim4Input").value = 0;
+
+  await fetch("/setTrims?t1=0&t2=0&t3=0&t4=0");
+  updateData();
+}
+
 async function killEngine() {
   await fetch("/kill");
   document.getElementById("throttleInput").value = 0;
@@ -460,13 +590,21 @@ function downloadCSV() {
     return;
   }
 
-  let csv = "seconds,rpm,throttle_input_percent,throttle_output_percent,idle_throttle_percent,max_throttle_percent,engine_run_enabled\n";
+  let csv = "seconds,rpm,throttle_input_percent,throttle_base_output_percent,servo1_output_percent,servo2_output_percent,servo3_output_percent,servo4_output_percent,servo1_trim_percent,servo2_trim_percent,servo3_trim_percent,servo4_trim_percent,idle_throttle_percent,max_throttle_percent,engine_run_enabled\n";
 
   rpmLog.forEach(row => {
     csv += row.seconds + ",";
     csv += row.rpm + ",";
     csv += row.throttleInput + ",";
-    csv += row.throttleOutput + ",";
+    csv += row.throttleBaseOutput + ",";
+    csv += row.servo1Output + ",";
+    csv += row.servo2Output + ",";
+    csv += row.servo3Output + ",";
+    csv += row.servo4Output + ",";
+    csv += row.servo1Trim + ",";
+    csv += row.servo2Trim + ",";
+    csv += row.servo3Trim + ",";
+    csv += row.servo4Trim + ",";
     csv += row.idleThrottle + ",";
     csv += row.maxThrottle + ",";
     csv += row.engineRunEnabled + "\n";
@@ -513,7 +651,7 @@ void killEngine() {
   engineRunEnabled = false;
   digitalWrite(KILL_RELAY_PIN, RELAY_KILL_STATE);
 
-  // Also command throttle to idle
+  // Also command all throttle servos to idle
   throttleInputPercent = 0;
 }
 
@@ -523,7 +661,7 @@ void enableRun() {
 }
 
 // =======================================================
-// THROTTLE FUNCTIONS
+// THROTTLE / SERVO FUNCTIONS
 // =======================================================
 
 int percentToMicroseconds(int percent) {
@@ -531,7 +669,7 @@ int percentToMicroseconds(int percent) {
   return map(percent, 0, 100, SERVO_MIN_US, SERVO_MAX_US);
 }
 
-int mapInputToThrottleOutput(int inputPercent) {
+int mapInputToBaseThrottleOutput(int inputPercent) {
   inputPercent = constrain(inputPercent, 0, 100);
 
   idleThrottlePercent = constrain(idleThrottlePercent, 0, 100);
@@ -545,10 +683,17 @@ int mapInputToThrottleOutput(int inputPercent) {
 }
 
 void applyThrottle() {
-  throttleOutputPercent = mapInputToThrottleOutput(throttleInputPercent);
+  throttleBaseOutputPercent = mapInputToBaseThrottleOutput(throttleInputPercent);
 
-  int servoMicros = percentToMicroseconds(throttleOutputPercent);
-  throttleServo.writeMicroseconds(servoMicros);
+  for (int i = 0; i < 4; i++) {
+    servoTrimPercent[i] = constrain(servoTrimPercent[i], MIN_SERVO_TRIM, MAX_SERVO_TRIM);
+
+    servoOutputPercent[i] = throttleBaseOutputPercent + servoTrimPercent[i];
+    servoOutputPercent[i] = constrain(servoOutputPercent[i], 0, 100);
+
+    int servoMicros = percentToMicroseconds(servoOutputPercent[i]);
+    servos[i].writeMicroseconds(servoMicros);
+  }
 }
 
 void setThrottleInput(int inputPercent) {
@@ -563,6 +708,15 @@ void setThrottleLimits(int idlePercent, int maxPercent) {
   if (maxThrottlePercent < idleThrottlePercent) {
     maxThrottlePercent = idleThrottlePercent;
   }
+
+  applyThrottle();
+}
+
+void setServoTrims(int t1, int t2, int t3, int t4) {
+  servoTrimPercent[0] = constrain(t1, MIN_SERVO_TRIM, MAX_SERVO_TRIM);
+  servoTrimPercent[1] = constrain(t2, MIN_SERVO_TRIM, MAX_SERVO_TRIM);
+  servoTrimPercent[2] = constrain(t3, MIN_SERVO_TRIM, MAX_SERVO_TRIM);
+  servoTrimPercent[3] = constrain(t4, MIN_SERVO_TRIM, MAX_SERVO_TRIM);
 
   applyThrottle();
 }
@@ -621,17 +775,40 @@ void handleRoot() {
 }
 
 void handleData() {
-  char json[280];
+  char json[600];
 
   snprintf(
     json,
     sizeof(json),
-    "{\"rpm\":%.1f,\"throttleInput\":%d,\"throttleOutput\":%d,\"idleThrottle\":%d,\"maxThrottle\":%d,\"engineRunEnabled\":%s}",
+    "{"
+    "\"rpm\":%.1f,"
+    "\"throttleInput\":%d,"
+    "\"throttleBaseOutput\":%d,"
+    "\"idleThrottle\":%d,"
+    "\"maxThrottle\":%d,"
+    "\"servo1Trim\":%d,"
+    "\"servo2Trim\":%d,"
+    "\"servo3Trim\":%d,"
+    "\"servo4Trim\":%d,"
+    "\"servo1Output\":%d,"
+    "\"servo2Output\":%d,"
+    "\"servo3Output\":%d,"
+    "\"servo4Output\":%d,"
+    "\"engineRunEnabled\":%s"
+    "}",
     currentRPM,
     throttleInputPercent,
-    throttleOutputPercent,
+    throttleBaseOutputPercent,
     idleThrottlePercent,
     maxThrottlePercent,
+    servoTrimPercent[0],
+    servoTrimPercent[1],
+    servoTrimPercent[2],
+    servoTrimPercent[3],
+    servoOutputPercent[0],
+    servoOutputPercent[1],
+    servoOutputPercent[2],
+    servoOutputPercent[3],
     engineRunEnabled ? "true" : "false"
   );
 
@@ -653,6 +830,24 @@ void handleSetLimits() {
     int max = server.arg("max").toInt();
 
     setThrottleLimits(idle, max);
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetTrims() {
+  if (
+    server.hasArg("t1") &&
+    server.hasArg("t2") &&
+    server.hasArg("t3") &&
+    server.hasArg("t4")
+  ) {
+    int t1 = server.arg("t1").toInt();
+    int t2 = server.arg("t2").toInt();
+    int t3 = server.arg("t3").toInt();
+    int t4 = server.arg("t4").toInt();
+
+    setServoTrims(t1, t2, t3, t4);
   }
 
   server.send(200, "text/plain", "OK");
@@ -691,8 +886,10 @@ void setup() {
     FALLING
   );
 
-  throttleServo.setPeriodHertz(50);
-  throttleServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  for (int i = 0; i < 4; i++) {
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(servoPins[i], SERVO_MIN_US, SERVO_MAX_US);
+  }
 
   setThrottleInput(0);
 
@@ -703,7 +900,7 @@ void setup() {
 
   Serial.println();
   Serial.println("======================================");
-  Serial.println("ESP32 Stinger RPM Controller Started");
+  Serial.println("ESP32 Stinger 4-Servo RPM Controller Started");
   Serial.println("======================================");
   Serial.print("WiFi Name: ");
   Serial.println(AP_SSID);
@@ -717,6 +914,7 @@ void setup() {
   server.on("/data", handleData);
   server.on("/setThrottle", handleSetThrottle);
   server.on("/setLimits", handleSetLimits);
+  server.on("/setTrims", handleSetTrims);
   server.on("/kill", handleKill);
   server.on("/enableRun", handleEnableRun);
 
@@ -745,16 +943,24 @@ void loop() {
     Serial.print(throttleInputPercent);
     Serial.print("%");
 
-    Serial.print(" | Servo Output: ");
-    Serial.print(throttleOutputPercent);
+    Serial.print(" | Base: ");
+    Serial.print(throttleBaseOutputPercent);
     Serial.print("%");
 
-    Serial.print(" | Idle: ");
-    Serial.print(idleThrottlePercent);
+    Serial.print(" | S1: ");
+    Serial.print(servoOutputPercent[0]);
     Serial.print("%");
 
-    Serial.print(" | Max: ");
-    Serial.print(maxThrottlePercent);
+    Serial.print(" | S2: ");
+    Serial.print(servoOutputPercent[1]);
+    Serial.print("%");
+
+    Serial.print(" | S3: ");
+    Serial.print(servoOutputPercent[2]);
+    Serial.print("%");
+
+    Serial.print(" | S4: ");
+    Serial.print(servoOutputPercent[3]);
     Serial.print("%");
 
     Serial.print(" | Engine: ");
