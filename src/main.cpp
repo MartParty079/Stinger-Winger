@@ -46,8 +46,8 @@ int maxThrottlePercent = 30;
 // Servo trim limits
 // Individual trims are added after the main throttle output.
 // Example: base output 20%, trim +3% => servo output 23%.
-const int MIN_SERVO_TRIM = -30;
-const int MAX_SERVO_TRIM = 30;
+const int MIN_SERVO_TRIM = -100;
+const int MAX_SERVO_TRIM = 100;
 
 // =======================================================
 // GLOBALS
