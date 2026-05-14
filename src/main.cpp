@@ -75,7 +75,14 @@ int throttleBaseOutputPercent = 0;  // mapped output before individual trims
 int servoTrimPercent[4] = {0, 0, 0, 0};
 int servoOutputPercent[4] = {0, 0, 0, 0};
 
-int throttleArray[21] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0};
+int throttleArray[21] = {
+  0, 10, 20, 
+  30, 40, 50, 
+  60, 70, 80, 
+  90, 100, 90, 
+  80, 70, 60, 
+  50, 40, 30, 
+  20, 10, 0}; //Array of servo steps
 
 bool engineRunEnabled = false;
 
@@ -879,9 +886,11 @@ void throttleSweep() {
   
   //for loop to fill in the array
 
-  // {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0}
+  // WARNING
+  // This code only uses servo 1
 
   
+
 
 }
 
