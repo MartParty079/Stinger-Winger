@@ -16,20 +16,17 @@ const int SERVO_PIN = 25;
 const int KILL_RELAY_PIN = 26;
 
 // Relay logic
-// Assumption:
-// relay OFF = engine killed
-// relay ON  = engine allowed to run
-//
-// If your relay module is active LOW, swap these.
+// Active-LOW relay module:
+// relay input LOW  = engine allowed to run
+// relay input HIGH = engine killed
 const int RELAY_RUN_STATE = LOW;
 const int RELAY_KILL_STATE = HIGH;
 
 // RPM settings
 const float PULSES_PER_REV = 1.0;
 
-// RPM updates every 200 ms.
-// With 1 pulse/rev, resolution is about 300 RPM.
-const uint32_t RPM_SAMPLE_MS = 200;
+// Webpage/data update rate
+const uint32_t DATA_UPDATE_MS = 100;
 
 // If no Hall pulse for this long, RPM = 0
 const uint32_t RPM_TIMEOUT_MS = 1000;
@@ -38,6 +35,11 @@ const uint32_t RPM_TIMEOUT_MS = 1000;
 // For 10,000 RPM and 1 pulse/rev, pulse spacing is about 6000 us.
 // 1000 us blocks false bounce/noise but still allows high RPM.
 const uint32_t MIN_PULSE_SPACING_US = 1000;
+
+// RPM smoothing
+// 0.0 = no update, 1.0 = no smoothing
+// Good starting range: 0.25 to 0.50
+const float RPM_SMOOTHING_ALPHA = 0.35;
 
 // Servo calibration
 const int SERVO_MIN_US = 1000;
@@ -73,11 +75,15 @@ const uint32_t SWEEP_STEP_DELAY_MS = 1000;
 WebServer server(80);
 Servo throttleServo;
 
-volatile uint32_t pulseCount = 0;
+// RPM interrupt variables
 volatile uint32_t lastPulseMicros = 0;
+volatile uint32_t lastPulseIntervalUs = 0;
+volatile uint32_t totalPulseCount = 0;
+
 portMUX_TYPE pulseMux = portMUX_INITIALIZER_UNLOCKED;
 
 float currentRPM = 0.0;
+float instantRPM = 0.0;
 
 int throttleInputPercent = 0;
 int throttleOutputPercent = 0;
@@ -89,7 +95,6 @@ int sweepIndex = 0;
 uint32_t lastSweepStepMs = 0;
 
 uint32_t lastRPMCalcMs = 0;
-uint32_t lastSamplePulseCount = 0;
 
 // =======================================================
 // HELPER FUNCTIONS
@@ -260,7 +265,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="card">
     <h2>Current RPM</h2>
     <div class="rpm-value" id="rpm">0</div>
-    <p class="small">HIGH-output Hall sensor on GPIO 27</p>
+    <p class="small">Period-based RPM from HIGH-output Hall sensor on GPIO 27</p>
   </div>
 
   <div class="card">
@@ -600,8 +605,8 @@ function clearLog() {
   alert("RPM log cleared.");
 }
 
-// Webpage updates every 200 ms
-setInterval(updateData, 200);
+// Webpage updates every 100 ms
+setInterval(updateData, 100);
 updateData();
 </script>
 
@@ -718,16 +723,27 @@ void runThrottleSweep() {
 }
 
 // =======================================================
-// RPM FUNCTIONS
+// RPM FUNCTIONS - PERIOD BASED
 // =======================================================
 
 void IRAM_ATTR hallISR() {
   uint32_t now = micros();
 
-  if ((uint32_t)(now - lastPulseMicros) > MIN_PULSE_SPACING_US) {
+  if (lastPulseMicros == 0) {
     portENTER_CRITICAL_ISR(&pulseMux);
-    pulseCount++;
     lastPulseMicros = now;
+    totalPulseCount++;
+    portEXIT_CRITICAL_ISR(&pulseMux);
+    return;
+  }
+
+  uint32_t interval = now - lastPulseMicros;
+
+  if (interval > MIN_PULSE_SPACING_US) {
+    portENTER_CRITICAL_ISR(&pulseMux);
+    lastPulseIntervalUs = interval;
+    lastPulseMicros = now;
+    totalPulseCount++;
     portEXIT_CRITICAL_ISR(&pulseMux);
   }
 }
@@ -735,31 +751,43 @@ void IRAM_ATTR hallISR() {
 void calculateRPM() {
   uint32_t nowMs = millis();
 
-  if (nowMs - lastRPMCalcMs < RPM_SAMPLE_MS) {
+  if (nowMs - lastRPMCalcMs < DATA_UPDATE_MS) {
     return;
   }
 
-  uint32_t totalPulses;
+  lastRPMCalcMs = nowMs;
+
+  uint32_t intervalCopy;
   uint32_t lastPulseCopy;
 
   portENTER_CRITICAL(&pulseMux);
-  totalPulses = pulseCount;
+  intervalCopy = lastPulseIntervalUs;
   lastPulseCopy = lastPulseMicros;
   portEXIT_CRITICAL(&pulseMux);
 
-  uint32_t pulseDelta = totalPulses - lastSamplePulseCount;
-  float sampleMinutes = (nowMs - lastRPMCalcMs) / 60000.0;
-
-  if (sampleMinutes > 0) {
-    currentRPM = (pulseDelta / PULSES_PER_REV) / sampleMinutes;
-  }
-
-  if ((uint32_t)(micros() - lastPulseCopy) > RPM_TIMEOUT_MS * 1000UL) {
+  if (lastPulseCopy == 0 || intervalCopy == 0) {
     currentRPM = 0.0;
+    instantRPM = 0.0;
+    return;
   }
 
-  lastSamplePulseCount = totalPulses;
-  lastRPMCalcMs = nowMs;
+  uint32_t nowUs = micros();
+
+  if ((uint32_t)(nowUs - lastPulseCopy) > RPM_TIMEOUT_MS * 1000UL) {
+    currentRPM = 0.0;
+    instantRPM = 0.0;
+    return;
+  }
+
+  instantRPM = 60000000.0 / ((float)intervalCopy * PULSES_PER_REV);
+
+  if (currentRPM <= 0.1) {
+    currentRPM = instantRPM;
+  } else {
+    currentRPM =
+      (RPM_SMOOTHING_ALPHA * instantRPM) +
+      ((1.0 - RPM_SMOOTHING_ALPHA) * currentRPM);
+  }
 }
 
 // =======================================================
@@ -771,15 +799,16 @@ void handleRoot() {
 }
 
 void handleData() {
-  char json[380];
+  char json[420];
 
   int usableMaxThrottle = getUsableMaxThrottle();
 
   snprintf(
     json,
     sizeof(json),
-    "{\"rpm\":%.1f,\"throttleInput\":%d,\"throttleOutput\":%d,\"idleThrottle\":%d,\"maxThrottle\":%d,\"throttleTrim\":%d,\"usableMaxThrottle\":%d,\"engineRunEnabled\":%s,\"sweepRunning\":%s}",
+    "{\"rpm\":%.1f,\"instantRpm\":%.1f,\"throttleInput\":%d,\"throttleOutput\":%d,\"idleThrottle\":%d,\"maxThrottle\":%d,\"throttleTrim\":%d,\"usableMaxThrottle\":%d,\"engineRunEnabled\":%s,\"sweepRunning\":%s}",
     currentRPM,
+    instantRPM,
     throttleInputPercent,
     throttleOutputPercent,
     idleThrottlePercent,
@@ -900,7 +929,8 @@ void setup() {
   Serial.print("Open: http://");
   Serial.println(ip);
   Serial.println("Hall Input: HIGH pulse, RISING edge");
-  Serial.println("RPM Sample Time: 200 ms");
+  Serial.println("RPM Method: period-based pulse timing");
+  Serial.println("Relay: RUN = LOW, KILL = HIGH");
   Serial.println("======================================");
 
   server.on("/", handleRoot);
@@ -935,8 +965,26 @@ void loop() {
     int usableMaxThrottle = getUsableMaxThrottle();
     int servoMicros = percentToMicroseconds(throttleOutputPercent);
 
+    uint32_t intervalCopy;
+    uint32_t pulseCountCopy;
+
+    portENTER_CRITICAL(&pulseMux);
+    intervalCopy = lastPulseIntervalUs;
+    pulseCountCopy = totalPulseCount;
+    portEXIT_CRITICAL(&pulseMux);
+
     Serial.print("RPM: ");
     Serial.print(currentRPM);
+
+    Serial.print(" | Instant RPM: ");
+    Serial.print(instantRPM);
+
+    Serial.print(" | Pulse Period: ");
+    Serial.print(intervalCopy);
+    Serial.print(" us");
+
+    Serial.print(" | Pulses: ");
+    Serial.print(pulseCountCopy);
 
     Serial.print(" | Input: ");
     Serial.print(throttleInputPercent);
