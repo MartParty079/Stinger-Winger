@@ -1,0 +1,14 @@
+git pull         # get latest version from GitHub
+# edit/save code   # make your changes in VS Code
+git add .        # prepare changed files
+git commit -m "message"  # save changes locally with a note
+git push         # upload changes to GitHub
+
+
+
+git pull
+
+
+git add .
+git commit -m "message"
+git push
