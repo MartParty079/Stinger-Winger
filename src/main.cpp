@@ -12,8 +12,14 @@ const char* AP_PASSWORD = "12345678";
 
 // Pins
 const int HALL_PIN = 27;
-const int SERVO_PIN = 25;
 const int KILL_RELAY_PIN = 26;
+
+// Servo pins
+const int NUM_SERVOS = 4;
+
+const int SERVO_PINS[NUM_SERVOS] = {
+  25, 32, 33, 14
+};
 
 // Relay logic
 // Active-LOW relay module:
@@ -25,15 +31,13 @@ const int RELAY_KILL_STATE = HIGH;
 // RPM settings
 const float PULSES_PER_REV = 1.0;
 
-// Webpage/data update rate
+// Web/data update rate
 const uint32_t DATA_UPDATE_MS = 100;
 
 // If no Hall pulse for this long, RPM = 0
 const uint32_t RPM_TIMEOUT_MS = 1000;
 
 // Hall sensor noise filter
-// For 10,000 RPM and 1 pulse/rev, pulse spacing is about 6000 us.
-// 1000 us blocks false bounce/noise but still allows high RPM.
 const uint32_t MIN_PULSE_SPACING_US = 1000;
 
 // RPM smoothing
@@ -45,7 +49,7 @@ const float RPM_SMOOTHING_ALPHA = 0.35;
 const int SERVO_MIN_US = 1000;
 const int SERVO_MAX_US = 2000;
 
-// Default throttle limits
+// Global throttle limits
 int idleThrottlePercent = 0;
 int maxThrottlePercent = 30;
 
@@ -73,7 +77,17 @@ const uint32_t SWEEP_STEP_DELAY_MS = 1000;
 // =======================================================
 
 WebServer server(80);
-Servo throttleServo;
+Servo throttleServos[NUM_SERVOS];
+
+// Individual servo commands, 0–100%
+int servoInputPercent[NUM_SERVOS] = {
+  0, 0, 0, 0
+};
+
+// Actual mapped servo outputs after global limits/trim
+int servoOutputPercent[NUM_SERVOS] = {
+  0, 0, 0, 0
+};
 
 // RPM interrupt variables
 volatile uint32_t lastPulseMicros = 0;
@@ -84,9 +98,6 @@ portMUX_TYPE pulseMux = portMUX_INITIALIZER_UNLOCKED;
 
 float currentRPM = 0.0;
 float instantRPM = 0.0;
-
-int throttleInputPercent = 0;
-int throttleOutputPercent = 0;
 
 bool engineRunEnabled = false;
 
@@ -116,6 +127,24 @@ int getUsableMaxThrottle() {
   return constrain(usableMaxThrottle, 0, 100);
 }
 
+int percentToMicroseconds(int percent) {
+  percent = constrain(percent, 0, 100);
+
+  // Normal direction
+  return map(percent, 0, 100, SERVO_MIN_US, SERVO_MAX_US);
+
+  // If servo direction is backward, comment the line above and use this:
+  // return map(percent, 0, 100, SERVO_MAX_US, SERVO_MIN_US);
+}
+
+int mapInputToServoOutput(int inputPercent) {
+  inputPercent = constrain(inputPercent, 0, 100);
+
+  int usableMaxThrottle = getUsableMaxThrottle();
+
+  return map(inputPercent, 0, 100, idleThrottlePercent, usableMaxThrottle);
+}
+
 // =======================================================
 // WEBPAGE
 // =======================================================
@@ -142,7 +171,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       border-radius: 14px;
       padding: 20px;
       margin: 15px auto;
-      max-width: 800px;
+      max-width: 850px;
       box-shadow: 0 0 20px rgba(0,0,0,0.45);
     }
 
@@ -245,7 +274,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </head>
 
 <body>
-  <h1>Stinger 125cc RPM + Throttle</h1>
+  <h1>Stinger 125cc RPM + Servo Control</h1>
 
   <div class="card">
     <h2>Engine Kill Switch</h2>
@@ -258,7 +287,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button class="big-kill" onclick="killEngine()">KILL ENGINE</button>
 
     <p class="small">
-      Kill command disables ignition relay and sends throttle input to 0%.
+      Kill disables ignition relay and sends all servo commands to 0%.
     </p>
   </div>
 
@@ -269,17 +298,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="card">
-    <h2>Throttle</h2>
-
-    <div class="data-row">
-      Input command:
-      <span class="throttle-yellow" id="throttleInputDisplay">0</span>%
-    </div>
-
-    <div class="data-row">
-      Actual servo output:
-      <span class="throttle-yellow" id="throttleOutputDisplay">0</span>%
-    </div>
+    <h2>Global Servo Limits</h2>
 
     <div class="data-row">
       Idle limit: <span id="idleDisplay">0</span>%
@@ -299,15 +318,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <hr>
 
-    <h3>Manual Throttle Command</h3>
-    <input id="throttleInput" type="number" min="0" max="100" value="0">
-    <button onclick="setThrottle()">Set Throttle</button>
-    <button class="danger" onclick="idleNow()">Idle Now</button>
-
-    <hr>
-
-    <h3>Throttle Limits</h3>
-
     <p>Idle throttle %</p>
     <input id="idleInput" type="number" min="0" max="100" value="0">
 
@@ -322,17 +332,68 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <button onclick="setTrim()">Set Trim</button>
 
     <p class="small">
-      Input command is 0-100%. Servo output is mapped between idle and usable max.
+      All individual servo commands are mapped through these global limits.
     </p>
+  </div>
+
+  <div class="card">
+    <h2>Individual Servo Control</h2>
+
+    <div class="data-row">
+      Servo 1:
+      Input <span class="throttle-yellow" id="servo1InputDisplay">0</span>%
+      | Output <span class="throttle-yellow" id="servo1OutputDisplay">0</span>%
+    </div>
+    <input id="servo1Input" type="number" min="0" max="100" value="0">
+    <button onclick="setServo(1)">Set Servo 1</button>
 
     <hr>
 
-    <h3>Throttle Sweep Test</h3>
+    <div class="data-row">
+      Servo 2:
+      Input <span class="throttle-yellow" id="servo2InputDisplay">0</span>%
+      | Output <span class="throttle-yellow" id="servo2OutputDisplay">0</span>%
+    </div>
+    <input id="servo2Input" type="number" min="0" max="100" value="0">
+    <button onclick="setServo(2)">Set Servo 2</button>
+
+    <hr>
+
+    <div class="data-row">
+      Servo 3:
+      Input <span class="throttle-yellow" id="servo3InputDisplay">0</span>%
+      | Output <span class="throttle-yellow" id="servo3OutputDisplay">0</span>%
+    </div>
+    <input id="servo3Input" type="number" min="0" max="100" value="0">
+    <button onclick="setServo(3)">Set Servo 3</button>
+
+    <hr>
+
+    <div class="data-row">
+      Servo 4:
+      Input <span class="throttle-yellow" id="servo4InputDisplay">0</span>%
+      | Output <span class="throttle-yellow" id="servo4OutputDisplay">0</span>%
+    </div>
+    <input id="servo4Input" type="number" min="0" max="100" value="0">
+    <button onclick="setServo(4)">Set Servo 4</button>
+
+    <br><br>
+    <button class="danger" onclick="setAllServosZero()">Set All Servos to 0%</button>
+
+    <p class="small">
+      Individual servo commands still obey global idle, max, and trim limits.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>All-Servo Sweep Test</h2>
+
     <button onclick="startSweep()">Start Sweep</button>
     <button class="danger" onclick="stopSweep()">Stop Sweep</button>
 
     <p class="small">
-      Sweep follows 0 → 100 → 0 using the throttle array.
+      Sweep moves all servos together: 0 → 100 → 0.
+      Global limits still cap the actual servo output.
     </p>
   </div>
 
@@ -418,13 +479,22 @@ async function updateData() {
 
     document.getElementById("rpm").innerText = Math.round(data.rpm);
 
-    document.getElementById("throttleInputDisplay").innerText = data.throttleInput;
-    document.getElementById("throttleOutputDisplay").innerText = data.throttleOutput;
-
     document.getElementById("idleDisplay").innerText = data.idleThrottle;
     document.getElementById("maxDisplay").innerText = data.maxThrottle;
     document.getElementById("trimDisplay").innerText = data.throttleTrim;
     document.getElementById("usableMaxDisplay").innerText = data.usableMaxThrottle;
+
+    document.getElementById("servo1InputDisplay").innerText = data.servo1Input;
+    document.getElementById("servo1OutputDisplay").innerText = data.servo1Output;
+
+    document.getElementById("servo2InputDisplay").innerText = data.servo2Input;
+    document.getElementById("servo2OutputDisplay").innerText = data.servo2Output;
+
+    document.getElementById("servo3InputDisplay").innerText = data.servo3Input;
+    document.getElementById("servo3OutputDisplay").innerText = data.servo3Output;
+
+    document.getElementById("servo4InputDisplay").innerText = data.servo4Input;
+    document.getElementById("servo4OutputDisplay").innerText = data.servo4Output;
 
     const engineStatus = document.getElementById("engineStatus");
 
@@ -440,6 +510,12 @@ async function updateData() {
       document.getElementById("idleInput").value = data.idleThrottle;
       document.getElementById("maxInput").value = data.maxThrottle;
       document.getElementById("trimInput").value = data.throttleTrim;
+
+      document.getElementById("servo1Input").value = data.servo1Input;
+      document.getElementById("servo2Input").value = data.servo2Input;
+      document.getElementById("servo3Input").value = data.servo3Input;
+      document.getElementById("servo4Input").value = data.servo4Input;
+
       limitsHaveLoaded = true;
     }
 
@@ -451,8 +527,14 @@ async function updateData() {
       rpmLog.push({
         seconds: ((now - logStartTime) / 1000).toFixed(2),
         rpm: Math.round(data.rpm),
-        throttleInput: data.throttleInput,
-        throttleOutput: data.throttleOutput,
+        servo1Input: data.servo1Input,
+        servo1Output: data.servo1Output,
+        servo2Input: data.servo2Input,
+        servo2Output: data.servo2Output,
+        servo3Input: data.servo3Input,
+        servo3Output: data.servo3Output,
+        servo4Input: data.servo4Input,
+        servo4Output: data.servo4Output,
         idleThrottle: data.idleThrottle,
         maxThrottle: data.maxThrottle,
         throttleTrim: data.throttleTrim,
@@ -473,19 +555,21 @@ async function updateData() {
   }
 }
 
-async function setThrottle() {
-  let value = Number(document.getElementById("throttleInput").value);
+async function setServo(num) {
+  let inputBox = document.getElementById("servo" + num + "Input");
+  let value = Number(inputBox.value);
 
   if (value < 0) value = 0;
   if (value > 100) value = 100;
 
-  await fetch("/setThrottle?value=" + value);
+  inputBox.value = value;
+
+  await fetch("/setServo?num=" + num + "&value=" + value);
   updateData();
 }
 
-async function idleNow() {
-  document.getElementById("throttleInput").value = 0;
-  await fetch("/setThrottle?value=0");
+async function setAllServosZero() {
+  await fetch("/setAllServos?value=0");
   updateData();
 }
 
@@ -524,7 +608,6 @@ async function setTrim() {
 
 async function killEngine() {
   await fetch("/kill");
-  document.getElementById("throttleInput").value = 0;
   updateData();
 }
 
@@ -566,13 +649,19 @@ function downloadCSV() {
     return;
   }
 
-  let csv = "seconds,rpm,throttle_input_percent,throttle_output_percent,idle_throttle_percent,max_throttle_percent,throttle_trim_percent,usable_max_throttle_percent,engine_run_enabled\n";
+  let csv = "seconds,rpm,servo1_input,servo1_output,servo2_input,servo2_output,servo3_input,servo3_output,servo4_input,servo4_output,idle_throttle_percent,max_throttle_percent,throttle_trim_percent,usable_max_throttle_percent,engine_run_enabled\n";
 
   rpmLog.forEach(row => {
     csv += row.seconds + ",";
     csv += row.rpm + ",";
-    csv += row.throttleInput + ",";
-    csv += row.throttleOutput + ",";
+    csv += row.servo1Input + ",";
+    csv += row.servo1Output + ",";
+    csv += row.servo2Input + ",";
+    csv += row.servo2Output + ",";
+    csv += row.servo3Input + ",";
+    csv += row.servo3Output + ",";
+    csv += row.servo4Input + ",";
+    csv += row.servo4Output + ",";
     csv += row.idleThrottle + ",";
     csv += row.maxThrottle + ",";
     csv += row.throttleTrim + ",";
@@ -625,7 +714,10 @@ void killEngineRelay() {
   sweepRunning = false;
   sweepIndex = 0;
 
-  throttleInputPercent = 0;
+  // Command every servo to 0%
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    servoInputPercent[i] = 0;
+  }
 }
 
 void enableRunRelay() {
@@ -634,37 +726,47 @@ void enableRunRelay() {
 }
 
 // =======================================================
-// THROTTLE FUNCTIONS
+// SERVO FUNCTIONS
 // =======================================================
 
-int percentToMicroseconds(int percent) {
-  percent = constrain(percent, 0, 100);
+void applyServo(int servoIndex) {
+  if (servoIndex < 0 || servoIndex >= NUM_SERVOS) {
+    return;
+  }
 
-  // Normal direction
-  return map(percent, 0, 100, SERVO_MIN_US, SERVO_MAX_US);
+  servoInputPercent[servoIndex] = constrain(servoInputPercent[servoIndex], 0, 100);
 
-  // If servo direction is backward, comment the line above and use this:
-  // return map(percent, 0, 100, SERVO_MAX_US, SERVO_MIN_US);
+  servoOutputPercent[servoIndex] =
+    mapInputToServoOutput(servoInputPercent[servoIndex]);
+
+  int servoMicros = percentToMicroseconds(servoOutputPercent[servoIndex]);
+
+  throttleServos[servoIndex].writeMicroseconds(servoMicros);
 }
 
-int mapInputToThrottleOutput(int inputPercent) {
+void applyAllServos() {
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    applyServo(i);
+  }
+}
+
+void setServoInput(int servoIndex, int inputPercent) {
+  if (servoIndex < 0 || servoIndex >= NUM_SERVOS) {
+    return;
+  }
+
+  servoInputPercent[servoIndex] = constrain(inputPercent, 0, 100);
+  applyServo(servoIndex);
+}
+
+void setAllServoInputs(int inputPercent) {
   inputPercent = constrain(inputPercent, 0, 100);
 
-  int usableMaxThrottle = getUsableMaxThrottle();
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    servoInputPercent[i] = inputPercent;
+  }
 
-  return map(inputPercent, 0, 100, idleThrottlePercent, usableMaxThrottle);
-}
-
-void applyThrottle() {
-  throttleOutputPercent = mapInputToThrottleOutput(throttleInputPercent);
-
-  int servoMicros = percentToMicroseconds(throttleOutputPercent);
-  throttleServo.writeMicroseconds(servoMicros);
-}
-
-void setThrottleInput(int inputPercent) {
-  throttleInputPercent = constrain(inputPercent, 0, 100);
-  applyThrottle();
+  applyAllServos();
 }
 
 void setThrottleLimits(int idlePercent, int maxPercent) {
@@ -675,12 +777,12 @@ void setThrottleLimits(int idlePercent, int maxPercent) {
     maxThrottlePercent = idleThrottlePercent;
   }
 
-  applyThrottle();
+  applyAllServos();
 }
 
 void setThrottleTrim(int trimPercent) {
   throttleTrimPercent = constrain(trimPercent, 0, 100);
-  applyThrottle();
+  applyAllServos();
 }
 
 // =======================================================
@@ -695,7 +797,7 @@ void runThrottleSweep() {
   if (!engineRunEnabled) {
     sweepRunning = false;
     sweepIndex = 0;
-    setThrottleInput(0);
+    setAllServoInputs(0);
     return;
   }
 
@@ -703,11 +805,13 @@ void runThrottleSweep() {
     lastSweepStepMs = millis();
 
     int commandedThrottle = throttleArray[sweepIndex];
-    setThrottleInput(commandedThrottle);
+
+    // Move all servos together
+    setAllServoInputs(commandedThrottle);
 
     Serial.print("Sweep step ");
     Serial.print(sweepIndex);
-    Serial.print(" | Commanded throttle input: ");
+    Serial.print(" | All servo command: ");
     Serial.print(commandedThrottle);
     Serial.println("%");
 
@@ -716,8 +820,9 @@ void runThrottleSweep() {
     if (sweepIndex >= throttleArraySize) {
       sweepRunning = false;
       sweepIndex = 0;
-      setThrottleInput(0);
-      Serial.println("Throttle sweep complete.");
+      setAllServoInputs(0);
+
+      Serial.println("All-servo sweep complete.");
     }
   }
 }
@@ -799,36 +904,73 @@ void handleRoot() {
 }
 
 void handleData() {
-  char json[420];
+  char json[900];
 
   int usableMaxThrottle = getUsableMaxThrottle();
 
   snprintf(
     json,
     sizeof(json),
-    "{\"rpm\":%.1f,\"instantRpm\":%.1f,\"throttleInput\":%d,\"throttleOutput\":%d,\"idleThrottle\":%d,\"maxThrottle\":%d,\"throttleTrim\":%d,\"usableMaxThrottle\":%d,\"engineRunEnabled\":%s,\"sweepRunning\":%s}",
+    "{"
+    "\"rpm\":%.1f,"
+    "\"instantRpm\":%.1f,"
+    "\"idleThrottle\":%d,"
+    "\"maxThrottle\":%d,"
+    "\"throttleTrim\":%d,"
+    "\"usableMaxThrottle\":%d,"
+    "\"engineRunEnabled\":%s,"
+    "\"sweepRunning\":%s,"
+    "\"servo1Input\":%d,"
+    "\"servo1Output\":%d,"
+    "\"servo2Input\":%d,"
+    "\"servo2Output\":%d,"
+    "\"servo3Input\":%d,"
+    "\"servo3Output\":%d,"
+    "\"servo4Input\":%d,"
+    "\"servo4Output\":%d"
+    "}",
     currentRPM,
     instantRPM,
-    throttleInputPercent,
-    throttleOutputPercent,
     idleThrottlePercent,
     maxThrottlePercent,
     throttleTrimPercent,
     usableMaxThrottle,
     engineRunEnabled ? "true" : "false",
-    sweepRunning ? "true" : "false"
+    sweepRunning ? "true" : "false",
+    servoInputPercent[0],
+    servoOutputPercent[0],
+    servoInputPercent[1],
+    servoOutputPercent[1],
+    servoInputPercent[2],
+    servoOutputPercent[2],
+    servoInputPercent[3],
+    servoOutputPercent[3]
   );
 
   server.send(200, "application/json", json);
 }
 
-void handleSetThrottle() {
-  if (server.hasArg("value")) {
+void handleSetServo() {
+  if (server.hasArg("num") && server.hasArg("value")) {
+    int servoNum = server.arg("num").toInt();
     int value = server.arg("value").toInt();
-    setThrottleInput(value);
+
+    // Web uses servo numbers 1–4
+    int servoIndex = servoNum - 1;
+
+    setServoInput(servoIndex, value);
   }
 
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/plain", "SERVO SET");
+}
+
+void handleSetAllServos() {
+  if (server.hasArg("value")) {
+    int value = server.arg("value").toInt();
+    setAllServoInputs(value);
+  }
+
+  server.send(200, "text/plain", "ALL SERVOS SET");
 }
 
 void handleSetLimits() {
@@ -853,7 +995,7 @@ void handleSetTrim() {
 
 void handleKill() {
   killEngineRelay();
-  applyThrottle();
+  applyAllServos();
   server.send(200, "text/plain", "KILLED");
 }
 
@@ -872,15 +1014,15 @@ void handleStartSweep() {
   sweepIndex = 0;
   lastSweepStepMs = millis();
 
-  server.send(200, "text/plain", "SWEEP STARTED");
+  server.send(200, "text/plain", "ALL SERVO SWEEP STARTED");
 }
 
 void handleStopSweep() {
   sweepRunning = false;
   sweepIndex = 0;
-  setThrottleInput(0);
+  setAllServoInputs(0);
 
-  server.send(200, "text/plain", "SWEEP STOPPED");
+  server.send(200, "text/plain", "ALL SERVO SWEEP STOPPED");
 }
 
 // =======================================================
@@ -908,10 +1050,13 @@ void setup() {
     RISING
   );
 
-  throttleServo.setPeriodHertz(50);
-  throttleServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    throttleServos[i].setPeriodHertz(50);
+    throttleServos[i].attach(SERVO_PINS[i], SERVO_MIN_US, SERVO_MAX_US);
+  }
 
-  setThrottleInput(0);
+  // Start all servos at 0% command
+  setAllServoInputs(0);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
@@ -931,11 +1076,13 @@ void setup() {
   Serial.println("Hall Input: HIGH pulse, RISING edge");
   Serial.println("RPM Method: period-based pulse timing");
   Serial.println("Relay: RUN = LOW, KILL = HIGH");
+  Serial.println("Servos: 4 individual controls with global limits");
   Serial.println("======================================");
 
   server.on("/", handleRoot);
   server.on("/data", handleData);
-  server.on("/setThrottle", handleSetThrottle);
+  server.on("/setServo", handleSetServo);
+  server.on("/setAllServos", handleSetAllServos);
   server.on("/setLimits", handleSetLimits);
   server.on("/setTrim", handleSetTrim);
   server.on("/kill", handleKill);
@@ -963,7 +1110,6 @@ void loop() {
     lastSerialPrintMs = millis();
 
     int usableMaxThrottle = getUsableMaxThrottle();
-    int servoMicros = percentToMicroseconds(throttleOutputPercent);
 
     uint32_t intervalCopy;
     uint32_t pulseCountCopy;
@@ -986,17 +1132,29 @@ void loop() {
     Serial.print(" | Pulses: ");
     Serial.print(pulseCountCopy);
 
-    Serial.print(" | Input: ");
-    Serial.print(throttleInputPercent);
+    Serial.print(" | S1: ");
+    Serial.print(servoInputPercent[0]);
+    Serial.print("%/");
+    Serial.print(servoOutputPercent[0]);
     Serial.print("%");
 
-    Serial.print(" | Servo Output: ");
-    Serial.print(throttleOutputPercent);
+    Serial.print(" | S2: ");
+    Serial.print(servoInputPercent[1]);
+    Serial.print("%/");
+    Serial.print(servoOutputPercent[1]);
     Serial.print("%");
 
-    Serial.print(" | Servo Pulse: ");
-    Serial.print(servoMicros);
-    Serial.print(" us");
+    Serial.print(" | S3: ");
+    Serial.print(servoInputPercent[2]);
+    Serial.print("%/");
+    Serial.print(servoOutputPercent[2]);
+    Serial.print("%");
+
+    Serial.print(" | S4: ");
+    Serial.print(servoInputPercent[3]);
+    Serial.print("%/");
+    Serial.print(servoOutputPercent[3]);
+    Serial.print("%");
 
     Serial.print(" | Idle Limit: ");
     Serial.print(idleThrottlePercent);
