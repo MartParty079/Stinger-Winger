@@ -14,9 +14,10 @@ const char* AP_PASSWORD = "12345678";
 const int HALL_PIN = 27;
 const int KILL_RELAY_PIN = 26;
 
-// Servo pins
+// Number of servos
 const int NUM_SERVOS = 4;
 
+// GPIO pins for servos
 const int SERVO_PINS[NUM_SERVOS] = {
   25, 32, 33, 14
 };
@@ -70,7 +71,7 @@ int throttleArray[21] = {
 };
 
 const int throttleArraySize = 21;
-const uint32_t SWEEP_STEP_DELAY_MS = 1000;
+const uint32_t SWEEP_STEP_DELAY_MS = 5000;
 
 // =======================================================
 // GLOBALS
@@ -112,18 +113,23 @@ uint32_t lastRPMCalcMs = 0;
 // =======================================================
 
 int getUsableMaxThrottle() {
+
+  // Contrain limits and trim to valid ranges
   idleThrottlePercent = constrain(idleThrottlePercent, 0, 100);
   maxThrottlePercent = constrain(maxThrottlePercent, 0, 100);
   throttleTrimPercent = constrain(throttleTrimPercent, 0, 100);
 
+  // Check that max is not below idle
   if (maxThrottlePercent < idleThrottlePercent) {
     maxThrottlePercent = idleThrottlePercent;
   }
 
+  // Calculate the maximum usable throttle after applying trim to the idle-to-max range
   int usableMaxThrottle =
     idleThrottlePercent +
     ((maxThrottlePercent - idleThrottlePercent) * throttleTrimPercent) / 100;
 
+  // Ensure the final usable max throttle is within 0–100%
   return constrain(usableMaxThrottle, 0, 100);
 }
 
@@ -708,6 +714,7 @@ updateData();
 // =======================================================
 
 void killEngineRelay() {
+  // Immediately disable engine run and set all servos to 0%
   engineRunEnabled = false;
   digitalWrite(KILL_RELAY_PIN, RELAY_KILL_STATE);
 
@@ -721,6 +728,7 @@ void killEngineRelay() {
 }
 
 void enableRunRelay() {
+  // Enable engine run - actual servo outputs will depend on current input commands and global limits/trim
   engineRunEnabled = true;
   digitalWrite(KILL_RELAY_PIN, RELAY_RUN_STATE);
 }
@@ -730,12 +738,14 @@ void enableRunRelay() {
 // =======================================================
 
 void applyServo(int servoIndex) {
+  // Check index bounds
   if (servoIndex < 0 || servoIndex >= NUM_SERVOS) {
     return;
   }
 
   servoInputPercent[servoIndex] = constrain(servoInputPercent[servoIndex], 0, 100);
 
+  // Map the input command through the global limits and trim to get the actual servo output command
   servoOutputPercent[servoIndex] =
     mapInputToServoOutput(servoInputPercent[servoIndex]);
 
@@ -745,6 +755,7 @@ void applyServo(int servoIndex) {
 }
 
 void applyAllServos() {
+  // Apply the mapping and command for all servos based on their current input commands and the global limits/trim
   for (int i = 0; i < NUM_SERVOS; i++) {
     applyServo(i);
   }
@@ -755,11 +766,13 @@ void setServoInput(int servoIndex, int inputPercent) {
     return;
   }
 
+  // Update the input command for this servo, then apply the mapping and command to update the actual servo output
   servoInputPercent[servoIndex] = constrain(inputPercent, 0, 100);
   applyServo(servoIndex);
 }
 
 void setAllServoInputs(int inputPercent) {
+  // Update the input command for all servos, then apply the mapping and command to update the actual servo outputs
   inputPercent = constrain(inputPercent, 0, 100);
 
   for (int i = 0; i < NUM_SERVOS; i++) {
@@ -770,6 +783,7 @@ void setAllServoInputs(int inputPercent) {
 }
 
 void setThrottleLimits(int idlePercent, int maxPercent) {
+  // Update global throttle limits and re-apply all servo commands to ensure outputs are updated according to the new limits
   idleThrottlePercent = constrain(idlePercent, 0, 100);
   maxThrottlePercent = constrain(maxPercent, 0, 100);
 
@@ -781,6 +795,7 @@ void setThrottleLimits(int idlePercent, int maxPercent) {
 }
 
 void setThrottleTrim(int trimPercent) {
+  // Update global throttle trim and re-apply all servo commands to ensure outputs are updated according to the new trim
   throttleTrimPercent = constrain(trimPercent, 0, 100);
   applyAllServos();
 }
